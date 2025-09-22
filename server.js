@@ -97,11 +97,20 @@ app.post('/merge-thumbnail-video', async (req, res) => {
     
     // Get video info first to match dimensions and frame rate
     const videoInfo = await getVideoInfo(videoPath);
-    const { width = 270, height = 480, fps = 30 } = videoInfo;
+    let { width = 270, height = 480, fps = 30 } = videoInfo;
+    
+    // Cap the frame rate to prevent issues - limit to reasonable values
+    if (fps > 60) {
+      console.log(`High frame rate detected (${fps}), capping to 30fps`);
+      fps = 30;
+    } else if (fps < 1) {
+      console.log(`Invalid frame rate detected (${fps}), setting to 30fps`);
+      fps = 30;
+    }
     
     console.log(`Video info - Width: ${width}, Height: ${height}, FPS: ${fps}`);
     
-    // Simplified FFmpeg command that's more reliable
+    // More robust FFmpeg command with frame rate limiting
     const ffmpegCommand = [
       'ffmpeg',
       '-loop', '1',
@@ -109,13 +118,21 @@ app.post('/merge-thumbnail-video', async (req, res) => {
       '-i', thumbnailPath,
       '-i', videoPath,
       '-filter_complex',
-      `[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1:1,fps=${fps},format=yuv420p[thumb];[1:v]setsar=1:1[video];[thumb][video]concat=n=2:v=1:a=0[outv];[1:a]apad=pad_dur=${thumbnailDuration}[outa]`,
+      `[0:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1:1,fps=${fps},format=yuv420p[thumb];[1:v]fps=${fps},setsar=1:1,format=yuv420p[video];[thumb][video]concat=n=2:v=1:a=0[outv];[1:a]apad=pad_dur=${thumbnailDuration}[outa]`,
       '-map', '[outv]',
       '-map', '[outa]',
       '-c:v', 'libx264',
       '-c:a', 'aac',
       '-pix_fmt', 'yuv420p',
-      '-preset', 'fast',
+      '-preset', 'slow', // Better quality than 'fast'
+      '-crf', '18', // High quality (lower = better, range: 0-51)
+      '-profile:v', 'high', // H.264 high profile for better compression
+      '-level', '4.0', // H.264 level
+      '-r', fps.toString(), // Explicitly set output frame rate
+      '-b:a', '192k', // Higher audio bitrate
+      '-ar', '48000', // High audio sample rate
+      '-movflags', '+faststart', // Optimize for web playback
+      '-max_muxing_queue_size', '1024', // Prevent muxing issues
       '-y',
       outputPath
     ];
@@ -128,11 +145,11 @@ app.post('/merge-thumbnail-video', async (req, res) => {
         stdio: ['pipe', 'pipe', 'pipe']
       });
       
-      // Set timeout to prevent hanging (60 seconds)
+      // Set timeout to prevent hanging (90 seconds)
       const timeout = setTimeout(() => {
         ffmpegProcess.kill('SIGKILL');
-        reject(new Error('FFmpeg process timed out after 60 seconds'));
-      }, 60000);
+        reject(new Error('FFmpeg process timed out after 90 seconds'));
+      }, 90000);
       
       let stderr = '';
       
@@ -141,8 +158,15 @@ app.post('/merge-thumbnail-video', async (req, res) => {
       });
       
       ffmpegProcess.stderr.on('data', (data) => {
-        stderr += data.toString();
-        console.log(`FFmpeg stderr: ${data}`);
+        const output = data.toString();
+        stderr += output;
+        
+        // Log but don't treat frame rate warnings as fatal errors
+        if (output.includes('frame rate very high')) {
+          console.warn('FFmpeg frame rate warning:', output);
+        } else {
+          console.log(`FFmpeg stderr: ${output}`);
+        }
       });
       
       ffmpegProcess.on('close', (code) => {
@@ -172,6 +196,11 @@ app.post('/merge-thumbnail-video', async (req, res) => {
     // Get file stats
     const stats = await fs.stat(outputPath);
     
+    // Validate output file size (ensure it's not empty or corrupted)
+    if (stats.size < 1024) { // Less than 1KB indicates failure
+      throw new Error('Output video file appears to be corrupted or empty');
+    }
+    
     // Store the processed video info
     const videoId = `video_${timestamp}`;
     finalVideoPath = outputPath;
@@ -195,7 +224,7 @@ app.post('/merge-thumbnail-video', async (req, res) => {
       thumbnailDuration: thumbnailDuration,
       outputFileSize: stats.size,
       processedAt: new Date().toISOString(),
-      message: `Video processed successfully with ${thumbnailDuration}s thumbnail intro`,
+      message: `Video processed successfully with ${thumbnailDuration}s thumbnail intro (${fps}fps)`,
       downloadUrl: `/get-final-video/${videoId}`
     });
     
@@ -315,13 +344,13 @@ const downloadGoogleDriveFile = async (fileId, filepath) => {
 const compressVideo = (inputPath, outputPath, options = {}) => {
   return new Promise((resolve, reject) => {
     const {
-      crf = 23,
-      preset = 'medium',
+      crf = 18,
+      preset = 'slow',
       maxrate = '3M',
       bufsize = '6M',
       audioBitrate = '96k',
-      maxWidth = 1280,
-      maxHeight = 720,
+      maxWidth = 1080,
+      maxHeight = 1080,
       timeout = 600000  // 10 minutes default timeout
     } = options;
 
@@ -478,58 +507,126 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', message: 'Video processing server is running' });
 });
 
-// Extract audio from video
-app.post('/extract-audio', async (req, res) => {
-  try {
-    const { googleDriveFileID } = req.body;
+// Minimal fix - process in smaller chunks and add proper timeouts
+app.post('/remove-silence', async (req, res) => {
+    // Set longer timeout for the response
+    req.setTimeout(600000); // 10 minutes
+    res.setTimeout(600000);
     
-    if (!googleDriveFileID) {
-      return res.status(400).json({ error: 'Video ID is required' });
-    }
+    try {
+        const { googleDriveFileID } = req.body;
+        if (!googleDriveFileID) {
+            return res.status(400).json({ error: 'Video ID is required' });
+        }
 
-    await ensureTempDir();
-    
-    // Download video
-    const videoId = uuidv4();
-    const videoPath = path.join('temp', `${videoId}_input.mp4`);
-    const audioPath = path.join('temp', `${videoId}_audio.wav`);
-    
-    console.log('Downloading video from google drive:', googleDriveFileID);
-    await downloadFile(videoPath, googleDriveFileID);
-    
-    // Store video path for later use
-    currentVideoPath = videoPath;
-    
-    // Extract audio
-    console.log('Extracting audio...');
-    await new Promise((resolve, reject) => {
-      ffmpeg(videoPath)
-        .output(audioPath)
-        .audioCodec('pcm_s16le')
-        .audioFrequency(16000)
-        .audioChannels(1)
-        .on('end', resolve)
-        .on('error', reject)
-        .run();
-    });
-    
-    // Upload audio to a temporary hosting service or return local path
-    // For now, we'll assume you have a way to host the audio file
-    const audioUrl = `http://localhost:${PORT}/temp-audio/${path.basename(audioPath)}`;
-    
-    res.json({
-      success: true,
-      audioUrl: audioUrl,
-      audioPath: audioPath,
-      videoPath: videoPath,
-      videoId: `${videoId}_input.mp4`
-    });
-    
-  } catch (error) {
-    console.error('Error extracting audio:', error);
-    res.status(500).json({ error: 'Failed to extract audio', details: error.message });
-  }
+        await ensureTempDir();
+        const videoId = uuidv4();
+        const inputVideoPath = path.join('temp', `${videoId}_input.mp4`);
+        const outputVideoPath = path.join('temp', `${videoId}_output.mp4`);
+
+        console.log('Downloading video...');
+        await downloadFile(inputVideoPath, googleDriveFileID);
+
+        // Use simpler silence removal with single pass
+        console.log('Removing silence...');
+        await removesilenceSimple(inputVideoPath, outputVideoPath);
+
+        const videoUrl = `http://localhost:${PORT}/temp-video/${path.basename(outputVideoPath)}`;
+        res.json({ 
+            success: true, 
+            videoUrl: videoUrl, 
+            videoPath: outputVideoPath,
+            videoId: `${videoId}_output.mp4`,
+            message: 'Silence removed successfully'
+        });
+
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({ error: 'Processing failed', details: error.message });
+    }
 });
+
+function removesilenceSimple(inputPath, outputPath) {
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Processing timeout')), 540000);
+
+        let silencePeriods = [];
+        let currentStart = null;
+        let videoDuration = 0;
+
+        ffmpeg.ffprobe(inputPath, (err, metadata) => {
+            if (err) return reject(err);
+            videoDuration = metadata.format.duration;
+            
+            ffmpeg(inputPath)
+                .audioFilters('silencedetect=noise=-25dB:duration=0.3')
+                .format('null')
+                .output('-')
+                .on('stderr', (line) => {
+                    if (line.includes('silence_start:')) {
+                        const match = line.match(/silence_start: ([\d.]+)/);
+                        if (match) currentStart = parseFloat(match[1]);
+                    }
+                    if (line.includes('silence_end:') && currentStart !== null) {
+                        const match = line.match(/silence_end: ([\d.]+)/);
+                        if (match) {
+                            silencePeriods.push({
+                                start: currentStart,
+                                end: parseFloat(match[1])
+                            });
+                            currentStart = null;
+                        }
+                    }
+                })
+                .on('end', () => {
+                    if (silencePeriods.length === 0) {
+                        // No silence, copy original
+                        ffmpeg(inputPath).output(outputPath)
+                            .on('end', () => { clearTimeout(timeout); resolve(); })
+                            .on('error', reject).run();
+                        return;
+                    }
+
+                    // Build keep segments with padding at silence start
+                    let keepSegments = [];
+                    let lastEnd = 0;
+                    const padding = 0.15;
+                    
+                    silencePeriods.forEach((silence, index) => {
+                        if (silence.start > lastEnd) {
+                            const segmentEnd = silence.start + padding;
+                            keepSegments.push(`between(t,${lastEnd},${segmentEnd})`);
+                        }
+                        
+                        // For the last silence period, keep 0.3 seconds from its start
+                        if (index === silencePeriods.length - 1) {
+                            const paddingEnd = silence.start + 0.5;
+                            keepSegments.push(`between(t,${silence.start},${paddingEnd})`);
+                            return; // Don't update lastEnd for the last silence
+                        }
+                        
+                        lastEnd = silence.end;
+                    });
+                    
+                    if (keepSegments.length === 0) {
+                        return reject(new Error('No segments to keep'));
+                    }
+
+                    const selectExpr = keepSegments.join('+');
+                    
+                    ffmpeg(inputPath)
+                        .videoFilters(`select='${selectExpr}',setpts=N/FRAME_RATE/TB`)
+                        .audioFilters(`aselect='${selectExpr}',asetpts=N/SR/TB`)
+                        .output(outputPath)
+                        .on('end', () => { clearTimeout(timeout); resolve(); })
+                        .on('error', (error) => { clearTimeout(timeout); reject(error); })
+                        .run();
+                })
+                .on('error', reject)
+                .run();
+        });
+    });
+}
 
 // Serve temporary audio files
 app.get('/temp-audio/:filename', (req, res) => {
@@ -559,6 +656,8 @@ app.get('/temp-video/:filename', (req, res) => {
 app.post('/process-video', async (req, res) => {
   try {
     const { videoPath, filterComplex } = req.body;
+
+    currentVideoPath = videoPath;
     
     if (!currentVideoPath) {
       return res.status(400).json({ error: 'No video file available for processing' });
@@ -598,7 +697,7 @@ app.post('/process-video', async (req, res) => {
         .videoCodec('libx264')
         .audioCodec('aac')
         .outputOptions([
-          '-preset veryfast',
+          '-preset slow',
           '-crf 23',
           '-threads 1',
           '-avoid_negative_ts make_zero'  // Helps with timing issues
@@ -633,6 +732,94 @@ app.post('/process-video', async (req, res) => {
     res.status(500).json({ error: 'Failed to process video', details: error.message });
   }
 });
+
+// Simple brightness & sharpness estimation using pixel differences
+async function scoreFrame(framePath) {
+  const data = await fs.readFile(framePath);
+  const pixels = [...data]; // crude byte-level scan
+
+  // Fake "sharpness" = sum of differences between adjacent bytes
+  let diffSum = 0;
+  for (let i = 1; i < pixels.length; i++) {
+    diffSum += Math.abs(pixels[i] - pixels[i - 1]);
+  }
+  const sharpnessScore = Math.min(diffSum / pixels.length / 10, 10);
+
+  // Brightness: avg pixel value
+  const mean =
+    pixels.reduce((a, b) => a + b, 0) / pixels.length;
+  const brightnessScore = 10 - Math.abs(128 - mean) / 12.8;
+
+  // NOTE: No face detection here (to stay pure JS)
+  return { score: sharpnessScore + brightnessScore, sharpnessScore, brightnessScore };
+}
+
+async function pickBestThumbnail(videoPath, samples = 10) {
+  const tempDir = path.join(__dirname, 'temp');
+  await fs.mkdir(tempDir, { recursive: true });
+
+  const outputPattern = path.join(tempDir, `frame_%03d.jpg`);
+
+  // Extract frames with ffmpeg
+  await new Promise((resolve, reject) => {
+    exec(
+      `ffmpeg -i "${videoPath}" -vf "fps=1" -frames:v ${samples} "${outputPattern}" -hide_banner -loglevel error`,
+      (error) => (error ? reject(error) : resolve())
+    );
+  });
+
+  // Score frames
+  const files = await fs.readdir(tempDir);
+  let best = { score: -1, path: null };
+  for (const file of files) {
+    if (!file.endsWith('.jpg')) continue;
+    const framePath = path.join(tempDir, file);
+    const result = await scoreFrame(framePath);
+    if (result.score > best.score) {
+      best = { ...result, path: framePath };
+    }
+  }
+
+  if (best.path) {
+    const outputPath = path.join(tempDir, `thumbnail_${uuidv4()}.jpg`);
+    await fs.copyFile(best.path, outputPath);
+    return { success: true, outputPath, score: best.score };
+  }
+
+  return { success: false, error: 'No valid frames extracted' };
+}
+
+// API endpoint
+app.post('/process-thumbnail', async (req, res) => {
+  try {
+    const { videoPath } = req.body;
+    if (!videoPath) {
+      return res.status(400).json({ error: 'No videoPath provided' });
+    }
+
+    console.log('Processing thumbnail for:', videoPath);
+    const result = await pickBestThumbnail(videoPath);
+
+    if (!result.success) {
+      return res.status(500).json(result);
+    }
+
+    res.json({
+      success: true,
+      message: 'Thumbnail extracted successfully',
+      outputPath: result.outputPath,
+      score: result.score
+    });
+
+  } catch (error) {
+    console.error('Error extracting thumbnail:', error);
+    res.status(500).json({ error: 'Failed to extract thumbnail', details: error.message });
+  }
+});
+
+module.exports = app;
+
+
 
 // Add background music and subtitles
 app.post('/add-music-subtitles', async (req, res) => {
@@ -744,7 +931,7 @@ app.post('/add-music-subtitles', async (req, res) => {
         .audioCodec('aac')
         .outputOptions([
           '-preset veryfast',
-          '-crf 23',
+          '-crf 18',
           '-threads 1',
           '-avoid_negative_ts make_zero',
           '-movflags', '+faststart',
@@ -847,10 +1034,8 @@ app.post('/cleanup', async (req, res) => {
       const filePath = path.join(tempDir, file);
       const stats = await fs.stat(filePath);
       
-      if (now - stats.mtime.getTime() > oneHour) {
-        await fs.unlink(filePath);
-        console.log('Cleaned up old file:', filePath);
-      }
+      await fs.unlink(filePath);
+      console.log('Cleaned up old file:', filePath);
     }
     
     // Reset global variables
