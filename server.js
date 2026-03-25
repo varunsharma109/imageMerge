@@ -1,9 +1,6 @@
 import express from "express";
 import sharp from "sharp";
 
-const app = express();
-app.use(express.json({ limit: "10mb" }));
-
 app.post("/merge-logo", async (req, res) => {
   try {
     const { baseImage, logoImage } = req.body;
@@ -11,16 +8,21 @@ app.post("/merge-logo", async (req, res) => {
     const baseBuffer = Buffer.from(baseImage, "base64");
     const logoBuffer = Buffer.from(logoImage, "base64");
 
+    // Resize logo relative to base image (important)
+    const LOGO_WIDTH = 150; // ~15% of 1024 → clean proportion
+
     const resizedLogo = await sharp(logoBuffer)
-      .resize(200)
+      .resize(LOGO_WIDTH)
       .toBuffer();
+
+    const PADDING = 20; // margin from edges
 
     const output = await sharp(baseBuffer)
       .composite([
         {
           input: resizedLogo,
-          top: 20,
-          left: 20
+          top: PADDING,   // top-left corner
+          left: PADDING
         }
       ])
       .png()
@@ -34,5 +36,3 @@ app.post("/merge-logo", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-app.listen(3000, () => console.log("Server running"));
