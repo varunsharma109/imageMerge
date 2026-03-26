@@ -1,6 +1,9 @@
 import express from "express";
 import sharp from "sharp";
 
+const app = express();
+app.use(express.json({ limit: "10mb" }));
+
 app.post("/merge-logo", async (req, res) => {
   try {
     const { baseImage, logoImage } = req.body;
