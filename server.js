@@ -4,6 +4,12 @@ const sharp = require("sharp");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+const PORT = 3001;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
 app.post("/merge-logo", async (req, res) => {
   try {
     const { baseImage, logoImage } = req.body;
