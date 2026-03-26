@@ -1,5 +1,5 @@
-import express from "express";
-import sharp from "sharp";
+const express = require("express");
+const sharp = require("sharp");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
