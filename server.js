@@ -20,8 +20,8 @@ app.post("/merge-logo", async (req, res) => {
     // Resize logo relative to base image (important)
     const metadata = await sharp(baseBuffer).metadata();
 
-    const LOGO_WIDTH = Math.floor(metadata.width * 0.25);
-    const PADDING = Math.floor(metadata.width * 0.05);
+    const LOGO_WIDTH = Math.floor(metadata.width * 0.20);
+    const PADDING = Math.floor(metadata.width * 0.02);
 
     const resizedLogo = await sharp(logoBuffer)
       .resize(LOGO_WIDTH)
