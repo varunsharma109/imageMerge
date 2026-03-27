@@ -18,13 +18,14 @@ app.post("/merge-logo", async (req, res) => {
     const logoBuffer = Buffer.from(logoImage, "base64");
 
     // Resize logo relative to base image (important)
-    const LOGO_WIDTH = 500; // ~15% of 1024 → clean proportion
+    const metadata = await sharp(baseBuffer).metadata();
+
+    const LOGO_WIDTH = Math.floor(metadata.width * 0.25);
+    const PADDING = Math.floor(metadata.width * 0.05);
 
     const resizedLogo = await sharp(logoBuffer)
       .resize(LOGO_WIDTH)
       .toBuffer();
-
-    const PADDING = 20; // margin from edges
 
     const output = await sharp(baseBuffer)
       .composite([
