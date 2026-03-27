@@ -18,7 +18,7 @@ app.post("/merge-logo", async (req, res) => {
     const logoBuffer = Buffer.from(logoImage, "base64");
 
     // Resize logo relative to base image (important)
-    const LOGO_WIDTH = 150; // ~15% of 1024 → clean proportion
+    const LOGO_WIDTH = 500; // ~15% of 1024 → clean proportion
 
     const resizedLogo = await sharp(logoBuffer)
       .resize(LOGO_WIDTH)
